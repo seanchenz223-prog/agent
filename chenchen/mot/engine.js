@@ -1,5 +1,7 @@
 "use strict";
 
+const { createHash } = require("node:crypto");
+
 const VERSION = "mot.v1";
 const STATES = new Set(["CREATED", "CHECKING", "NEEDS_ATTENTION", "PENDING_APPROVAL", "RESOLVED", "BLOCKED", "FAILED", "CANCELLED", "UNKNOWN"]);
 const clone = value => structuredClone(value);
@@ -13,7 +15,7 @@ const error = (code, statusCode = 422) => Object.assign(new Error(code), { code,
 function empty(ownerId) {
   return { schema_version: VERSION, owner_id: ownerId, revision: 0, stores: [], terminals: [], accounts: [],
     transactions: [], reservations: [], tasks: [], inbox: [], notification_events: [], audit: [],
-    memory: [], checks: [], ingests: [], pool_configs: [], observed_transaction_keys: [],
+    memory: [], checks: [], ingests: [], pool_configs: [], monitors: [], observed_transaction_keys: [],
     last_check_at: null, last_check_error: null };
 }
 
@@ -26,6 +28,9 @@ function validateState(state, ownerId) {
       state.tasks.some(task => task.owner_id !== ownerId || !STATES.has(task.state)) ||
       state.reservations.some(row => row.owner_id !== ownerId || !money(row.amount_minor)))
     throw error("PERSISTENCE_CORRUPT", 503);
+  // Older mot.v1 records predate persistent monitors.
+  if (state.monitors === undefined) state.monitors = [];
+  if (!Array.isArray(state.monitors) || state.monitors.some(row => row.owner_id !== ownerId)) throw error("PERSISTENCE_CORRUPT", 503);
   return state;
 }
 
@@ -84,7 +89,7 @@ function validateFixture(data) {
         (tx.store_id !== null && !stores.has(tx.store_id)) ||
         (tx.terminal_id !== null && (!terminals.has(tx.terminal_id) ||
           data.terminals.find(t => t.terminal_id === tx.terminal_id).store_id !== tx.store_id)) ||
-        !money(tx.amount_minor) || tx.currency !== "CNY" ||
+        !money(tx.amount_minor) || tx.amount_minor === 0 || tx.currency !== "CNY" ||
         !["RECEIPT", "PAYMENT", "REFUND", "INTERNAL_TRANSFER", "SETTLEMENT"].includes(tx.transaction_type) ||
         !["PENDING", "SETTLED", "CANCELLED"].includes(tx.status) || !iso(tx.occurred_at) ||
         (tx.settled_at !== null && !iso(tx.settled_at)) || !iso(tx.as_of) ||
@@ -113,14 +118,17 @@ function overview(state, at) {
   const poolTotal = sum(pool.map(a => a.balance_minor));
   const held = sum(state.reservations.filter(r => r.status === "ACTIVE").map(r => r.amount_minor));
   // Source and Worker clocks may differ slightly; larger future timestamps remain unknown.
-  const fresh = pool.length > 0 && pool.every(a => {
+  const isFresh = a => {
     const age = Date.parse(at) - Date.parse(a.as_of);
     return age <= 24 * 3600_000 && age >= -5 * 60_000;
-  });
+  };
+  const fresh = pool.length > 0 && pool.every(isFresh);
+  const totalFresh = verified.length === state.accounts.length && verified.length > 0 && verified.every(isFresh);
   return { schema_version: VERSION, owner_id: state.owner_id, revision: state.revision,
-    as_of: pool.length ? pool.map(a => a.as_of).sort()[0] : null, evaluated_at: at,
+    as_of: verified.length ? verified.map(a => a.as_of).sort()[0] : null,
+    pool_as_of: pool.length ? pool.map(a => a.as_of).sort()[0] : null, evaluated_at: at,
     stores: state.stores.length, terminals: state.terminals.length, accounts: state.accounts.length,
-    total_verified_minor: verified.length === state.accounts.length && verified.length ? total : null,
+    total_verified_minor: totalFresh ? total : null, total_balance_fresh: totalFresh,
     pool_account_ids: pool.map(a => a.account_id), pool_balance_minor: fresh ? poolTotal : null,
     reserved_minor: held, available_minor: fresh ? Math.max(0, poolTotal - held) : null,
     pending_settlement_minor: sum(state.transactions.filter(t => t.transaction_type === "RECEIPT" && t.status === "PENDING").map(t => t.amount_minor)),
@@ -234,6 +242,22 @@ class MotEngine {
       const at = this.now();
       const active = new Set();
       const detected = findings(state, at);
+      const evaluatedMonitorIds = new Set();
+      for (const monitor of state.monitors || []) {
+        if (monitor.status !== "ACTIVE" || (trigger === "scheduled" && Date.parse(monitor.next_run_at) > Date.parse(at))) continue;
+        evaluatedMonitorIds.add(monitor.monitor_id);
+        const view = overview(state, at);
+        const current = monitor.scope === "POOL" ? view.available_minor : null;
+        if (current === null) detected.push({ key: `MONITOR_UNKNOWN:${monitor.monitor_id}`, kind: "MONITOR_UNKNOWN", severity: "HIGH",
+          evidence: { monitor_id: monitor.monitor_id, reason: "BALANCE_NOT_VERIFIED", as_of: view.as_of } });
+        else if (current < monitor.threshold_minor) detected.push({ key: `MONITOR_BELOW_THRESHOLD:${monitor.monitor_id}`,
+          kind: "MONITOR_BELOW_THRESHOLD", severity: "HIGH", evidence: { monitor_id: monitor.monitor_id,
+            scope: monitor.scope, current_minor: current, threshold_minor: monitor.threshold_minor, as_of: view.as_of } });
+        monitor.last_run_at = at;
+        monitor.next_run_at = this.scheduler?.nextRunAt ||
+          new Date(Math.ceil((Date.parse(at) + 1) / 900_000) * 900_000).toISOString();
+        monitor.updated_at = at;
+      }
       const observed = new Set(state.observed_transaction_keys);
       const fresh = state.transactions.filter(t => !observed.has(`${t.source_system}:${t.external_transaction_id}`));
       const newReceipts = fresh.filter(t => t.transaction_type === "RECEIPT").length;
@@ -259,6 +283,11 @@ class MotEngine {
         }
       }
       for (const task of state.tasks) {
+        if (task.finding_key?.startsWith("MONITOR_") && !active.has(task.finding_key)) {
+          const monitorId = task.finding_key.split(":")[1];
+          const monitor = state.monitors.find(row => row.monitor_id === monitorId);
+          if (monitor?.status === "ACTIVE" && !evaluatedMonitorIds.has(monitorId)) continue;
+        }
         if (!active.has(task.finding_key) && task.finding_key && task.state === "NEEDS_ATTENTION") {
           transition(task, "RESOLVED", at, { reason: "finding_cleared" });
           for (const item of state.inbox.filter(i => i.task_id === task.task_id)) { item.status = "RESOLVED"; item.updated_at = at; }
@@ -280,6 +309,53 @@ class MotEngine {
     const task = await this.read(ownerId, state => state.tasks.find(t => t.task_id === taskId) || null);
     if (!task) throw error("TASK_NOT_FOUND", 404);
     return task;
+  }
+
+  async createMonitor(ownerId, input) {
+    const { scope, threshold_minor, frequency_minutes, channel, timezone, request_key } = input || {};
+    if (scope !== "POOL" || !money(threshold_minor) || threshold_minor <= 0 || frequency_minutes !== 15 ||
+        channel !== "INBOX_ONLY" || timezone !== "Asia/Shanghai" || !validId(request_key)) throw error("INVALID_MONITOR");
+    return this.repository.transact(ownerId, state => {
+      state.monitors ||= [];
+      const prior = state.monitors.find(row => row.request_key === request_key);
+      if (prior) {
+        if (prior.threshold_minor !== threshold_minor || prior.scope !== scope) throw error("IDEMPOTENCY_CONFLICT", 409);
+        return clone(prior);
+      }
+      const at = this.now();
+      const record = { monitor_id: id("mot-monitor-"), owner_id: ownerId, scope, threshold_minor,
+        frequency_minutes, channel, timezone, status: "ACTIVE", request_key, created_at: at, updated_at: at,
+        next_run_at: this.scheduler?.nextRunAt || new Date(Math.ceil(Date.parse(at) / 900_000) * 900_000).toISOString(), last_run_at: null };
+      state.monitors.push(record); state.revision++;
+      audit(state, at, "monitor.created", null, { monitor_id: record.monitor_id, threshold_minor, scope });
+      return clone(record);
+    });
+  }
+
+  async changeMonitor(ownerId, monitorId, { action, threshold_minor, request_key } = {}) {
+    if (!validId(monitorId) || !validId(request_key) || !["PAUSE", "RESUME", "CANCEL", "UPDATE"].includes(action) ||
+        (action === "UPDATE" && (!money(threshold_minor) || threshold_minor <= 0))) throw error("INVALID_MONITOR_CHANGE");
+    return this.repository.transact(ownerId, state => {
+      state.monitors ||= [];
+      const monitor = state.monitors.find(row => row.monitor_id === monitorId);
+      if (!monitor) throw error("MONITOR_NOT_FOUND", 404);
+      const prior = state.audit.find(row => row.event_type === "monitor.changed" && row.evidence.request_key === request_key);
+      if (prior) {
+        if (prior.evidence.monitor_id !== monitorId || prior.evidence.action !== action ||
+            prior.evidence.threshold_minor !== (action === "UPDATE" ? threshold_minor : null)) throw error("IDEMPOTENCY_CONFLICT", 409);
+        return clone(monitor);
+      }
+      if (monitor.status === "CANCELLED") throw error("MONITOR_CANCELLED", 409);
+      const at = this.now();
+      if (action === "PAUSE") monitor.status = "PAUSED";
+      const nextScheduled = this.scheduler?.nextRunAt || new Date(Math.ceil(Date.parse(at) / 900_000) * 900_000).toISOString();
+      if (action === "RESUME") { monitor.status = "ACTIVE"; monitor.next_run_at = nextScheduled; }
+      if (action === "CANCEL") monitor.status = "CANCELLED";
+      if (action === "UPDATE") { monitor.threshold_minor = threshold_minor; monitor.next_run_at = nextScheduled; }
+      monitor.updated_at = at; state.revision++;
+      audit(state, at, "monitor.changed", null, { monitor_id: monitorId, action, threshold_minor: action === "UPDATE" ? threshold_minor : null, request_key });
+      return clone(monitor);
+    });
   }
 
   async memory(ownerId, { type, key, value, consent, request_key }) {
@@ -375,6 +451,92 @@ class MotEngine {
     });
   }
 
+  async proposePayment(ownerId, { amount_minor, account_id, payee_id, currency, request_key }) {
+    if (!money(amount_minor) || amount_minor === 0 || !validId(account_id) || !validId(payee_id) ||
+        currency !== "CNY" || !validId(request_key)) throw error("INVALID_PAYMENT_PROPOSAL");
+    return this.repository.transact(ownerId, async state => {
+      const proposal = { amount_minor, account_id, payee_id, currency, request_key, mode: "SIMULATION_ONLY" };
+      const fingerprint = createHash("sha256").update(JSON.stringify(proposal)).digest("hex");
+      const existing = state.tasks.find(task => task.proposal?.request_key === request_key);
+      if (existing) {
+        if (existing.kind !== "PAYMENT_PROPOSAL" || existing.proposal_fingerprint !== fingerprint)
+          throw error("IDEMPOTENCY_CONFLICT", 409);
+        return clone(existing);
+      }
+      const account = state.accounts.find(row => row.account_id === account_id);
+      const view = overview(state, this.now());
+      if (!account?.verified || !account.pool || !view.balance_fresh ||
+          amount_minor > account.balance_minor || amount_minor > view.available_minor)
+        throw error("FUNDING_UNAVAILABLE", 409);
+      const at = this.now();
+      const task = { task_id: id("mot-task-"), owner_id: ownerId, source: "user_proposal", kind: "PAYMENT_PROPOSAL",
+        state: "CREATED", created_at: at, updated_at: at, ledger_revision: state.revision + 1,
+        evidence: [], approval: null, review: { status: "PENDING", execution_allowed: false },
+        proposal, proposal_fingerprint: fingerprint };
+      state.tasks.push(task);
+      transition(task, "CHECKING", at, { account_balance_minor: account.balance_minor,
+        pool_available_minor: view.available_minor, ledger_revision: state.revision, proposal_fingerprint: fingerprint });
+      if (this.coreRisk) {
+        try {
+          const review = await this.coreRisk.review({ owner_id: ownerId, task_id: task.task_id,
+            ledger_revision: task.ledger_revision, proposal: clone(proposal), proposal_fingerprint: fingerprint,
+            overview: view });
+          if (review?.status === "VERIFIED" && review.risk === "APPROVE" && review.verified === true &&
+              validId(review.core_task_id) && validId(review.risk_check_id) && validId(review.proof_id) &&
+              review.proposal_fingerprint === fingerprint && review.mode === "SIMULATION_ONLY") {
+            task.review = { ...clone(review), execution_allowed: false };
+            transition(task, "PENDING_APPROVAL", at, { core_task_id: review.core_task_id,
+              risk_check_id: review.risk_check_id, proposal_fingerprint: fingerprint });
+          } else {
+            task.review = { status: review?.status || "UNAVAILABLE", risk: review?.risk || "UNAVAILABLE",
+              execution_allowed: false };
+            transition(task, "BLOCKED", at, { reason: "CORE_RISK_NOT_VERIFIED" });
+          }
+        } catch {
+          task.review = { status: "UNKNOWN", risk: "UNKNOWN", execution_allowed: false };
+          transition(task, "UNKNOWN", at, { reason: "CORE_RISK_OUTCOME_UNKNOWN" });
+        }
+      } else {
+        task.review = { status: "UNAVAILABLE", core: "UNAVAILABLE", risk: "UNAVAILABLE", execution_allowed: false };
+        transition(task, "BLOCKED", at, { reason: "CORE_RISK_UNAVAILABLE" });
+      }
+      state.revision++;
+      audit(state, at, "payment.proposed", task.task_id, { proposal, proposal_fingerprint: fingerprint, review: task.review });
+      return clone(task);
+    });
+  }
+
+  async proposeTransfer(ownerId, { amount_minor, from_account_id, to_account_id, request_key }) {
+    if (!money(amount_minor) || amount_minor === 0 || !validId(from_account_id) ||
+        !validId(to_account_id) || from_account_id === to_account_id || !validId(request_key))
+      throw error("INVALID_TRANSFER_PROPOSAL");
+    return this.repository.transact(ownerId, state => {
+      const existing = state.tasks.find(t => t.proposal?.request_key === request_key);
+      if (existing) {
+        if (existing.kind !== "TRANSFER_PROPOSAL" || existing.proposal.amount_minor !== amount_minor ||
+            existing.proposal.from_account_id !== from_account_id || existing.proposal.to_account_id !== to_account_id)
+          throw error("IDEMPOTENCY_CONFLICT", 409);
+        return clone(existing);
+      }
+      const view = overview(state, this.now());
+      const source = state.accounts.find(account => account.account_id === from_account_id);
+      const target = state.accounts.find(account => account.account_id === to_account_id);
+      if (!source?.verified || !target?.verified || !view.balance_fresh || !source.pool ||
+          amount_minor > view.available_minor) throw error("FUNDING_UNAVAILABLE", 409);
+      const at = this.now();
+      const task = { task_id: id("mot-task-"), owner_id: ownerId, source: "user_proposal", kind: "TRANSFER_PROPOSAL",
+        state: "CREATED", created_at: at, updated_at: at, ledger_revision: state.revision + 1,
+        evidence: [], approval: null, review: { status: "UNAVAILABLE", core: "UNAVAILABLE", risk: "UNAVAILABLE", execution_allowed: false },
+        proposal: { amount_minor, from_account_id, to_account_id, request_key, mode: "SIMULATION_ONLY" } };
+      state.tasks.push(task);
+      transition(task, "CHECKING", at, { available_minor: view.available_minor, ledger_revision: state.revision });
+      transition(task, "BLOCKED", at, { reason: "TRANSFER_CORE_RISK_CONTRACT_UNAVAILABLE" });
+      state.revision++;
+      audit(state, at, "transfer.proposed", task.task_id, { proposal: task.proposal, review: task.review });
+      return clone(task);
+    });
+  }
+
   async decideApproval(ownerId, taskId, decision) {
     if (!["APPROVE", "REJECT"].includes(decision)) throw error("INVALID_DECISION");
     return this.repository.transact(ownerId, async state => {
@@ -400,7 +562,10 @@ class MotEngine {
         if (approval?.verified !== true || approval?.decision !== "APPROVE" ||
             approval?.task_id !== taskId || approval?.ledger_revision !== state.revision || !validId(approval.proof_id))
           throw error("APPROVAL_NOT_VERIFIED", 409);
-        task.approval = { ...clone(approval), at, owner_id: ownerId, ledger_revision: state.revision + 1 };
+        if (task.kind === "PAYMENT_PROPOSAL" && approval.proposal_fingerprint !== task.proposal_fingerprint)
+          throw error("APPROVAL_NOT_VERIFIED", 409);
+        task.approval = { ...clone(approval), at, owner_id: ownerId, ledger_revision: state.revision + 1,
+          ...(task.kind === "PAYMENT_PROPOSAL" ? { expires_at: new Date(Date.parse(at) + 5 * 60_000).toISOString() } : {}) };
       }
       state.revision++;
       audit(state, at, "approval.recorded", taskId, { decision });
@@ -414,14 +579,44 @@ class MotEngine {
       const task = state.tasks.find(t => t.task_id === taskId);
       if (!task) throw error("TASK_NOT_FOUND", 404);
       if (task.simulation?.request_key === requestKey) return clone(task.simulation);
-      if (task.kind !== "RESERVATION_PROPOSAL" || task.state !== "PENDING_APPROVAL" ||
+       if (!["RESERVATION_PROPOSAL", "PAYMENT_PROPOSAL"].includes(task.kind) || task.state !== "PENDING_APPROVAL" ||
           task.approval?.decision !== "APPROVE" || task.review?.status !== "VERIFIED" ||
           task.review?.risk !== "APPROVE" || task.approval.ledger_revision !== state.revision)
         throw error("SIMULATION_BLOCKED", 409);
       const view = overview(state, this.now());
-      if (!view.balance_fresh ||
-          JSON.stringify([...task.proposal.account_ids].sort()) !== JSON.stringify([...view.pool_account_ids].sort()) ||
-          task.proposal.amount_minor > view.available_minor) throw error("FUNDING_UNAVAILABLE", 409);
+       if (!view.balance_fresh || task.proposal.amount_minor > view.available_minor)
+         throw error("FUNDING_UNAVAILABLE", 409);
+       if (task.kind === "RESERVATION_PROPOSAL" &&
+           JSON.stringify([...task.proposal.account_ids].sort()) !== JSON.stringify([...view.pool_account_ids].sort()))
+         throw error("FUNDING_UNAVAILABLE", 409);
+       if (task.kind === "PAYMENT_PROPOSAL") {
+         const source = state.accounts.find(row => row.account_id === task.proposal.account_id);
+         if (!source?.verified || !source.pool || source.balance_minor < task.proposal.amount_minor ||
+             !task.approval.expires_at || Date.parse(task.approval.expires_at) <= Date.parse(this.now()) ||
+             task.review.proposal_fingerprint !== task.proposal_fingerprint ||
+             task.approval.proposal_fingerprint !== task.proposal_fingerprint) throw error("SIMULATION_BLOCKED", 409);
+         const at = this.now();
+         const before_minor = source.balance_minor;
+         source.balance_minor -= task.proposal.amount_minor;
+         source.revision++;
+         source.as_of = at;
+         const transactionId = id("paper-payment-");
+         state.transactions.push({ store_id: null, terminal_id: null, account_id: source.account_id,
+           source_system: "PAPER_SIMULATION", external_transaction_id: transactionId,
+           amount_minor: task.proposal.amount_minor, currency: "CNY", transaction_type: "PAYMENT",
+           status: "SETTLED", occurred_at: at, settled_at: at, as_of: at, revision: 1, due_at: null,
+           related_transaction_id: null, transfer_id: null, payee_id: task.proposal.payee_id,
+           task_id: taskId, mode: "SIMULATION_ONLY" });
+         task.simulation = { receipt_id: id("mot-receipt-"), task_id: taskId, owner_id: ownerId,
+           request_key: requestKey, transaction_id: transactionId, account_id: source.account_id,
+           payee_id: task.proposal.payee_id, amount_minor: task.proposal.amount_minor, currency: "CNY",
+           balance_before_minor: before_minor, balance_after_minor: source.balance_minor,
+           proposal_fingerprint: task.proposal_fingerprint, mode: "SIMULATION_ONLY", side_effects: false, at };
+         transition(task, "RESOLVED", at, { receipt_id: task.simulation.receipt_id });
+         state.revision++;
+         audit(state, at, "payment.simulated", taskId, task.simulation);
+         return clone(task.simulation);
+       }
       const at = this.now();
       const reservation = { reservation_id: id("mot-reservation-"), task_id: taskId, owner_id: ownerId,
         account_ids: clone(task.proposal.account_ids), amount_minor: task.proposal.amount_minor,
